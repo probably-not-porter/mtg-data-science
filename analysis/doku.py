@@ -4,10 +4,10 @@ import numpy as np
 import sqlite3
 from itertools import combinations
 from tqdm import tqdm
+import re
 
-# --- CONFIGURATION ---
-MIN_CARDS_PER_CELL = 1
-DB_PATH = "mtg_relational_grids.db"
+MIN_CARDS_PER_CELL = 3 
+DB_PATH = "mtg_relational_grids_3.db"
 BATCH_SIZE = 50000 
 
 opt = [
@@ -58,27 +58,41 @@ opt = [
     {"cat": "subtype", "value": "Nightmare"}, {"cat": "subtype", "value": "Wolf"}
 ]
 
-# --- 1. DATA PREP ---
 print("Loading dataset...")
-df = pd.DataFrame(json.load(open("/storage/datasets/mtg-tcg/oracle-cards.json")))
+raw_data = json.load(open("/storage/datasets/mtg-tcg/oracle-cards.json"))
+df = pd.DataFrame(raw_data)
+
+valid_layouts = ['normal', 'split', 'flip', 'transform', 'modal_dfc', 'adventure', 'host', 'augment']
+df = df[df['layout'].isin(valid_layouts)]
 
 cat_sets = {}
 for item in tqdm(opt, desc="Building Sets"):
     key = f"{item['cat']}_{item['value']}"
+    val = str(item['value'])
+    
     if item['cat'] == 'color':
-        cat_sets[key] = set(df[df['colors'].apply(lambda x: isinstance(x, list) and item['value'] in x)]['name'])
-    elif item['cat'] in ['type', 'subtype']:
-        cat_sets[key] = set(df[df['type_line'].str.contains(item['value'], na=False, case=True)]['name'])
+        cat_sets[key] = set(df[df['colors'].apply(lambda x: isinstance(x, list) and val in x)]['name'])
+    
+    elif item['cat'] == 'type':
+        cat_sets[key] = set(df[df['type_line'].str.contains(rf"\b{val}\b", na=False)]['name'])
+    
+    elif item['cat'] == 'subtype':
+        def has_subtype(tl):
+            if not isinstance(tl, str) or '—' not in tl: return False
+            subsets = tl.split('—')[1].split()
+            return val in subsets
+        cat_sets[key] = set(df[df['type_line'].apply(has_subtype)]['name'])
+    
     elif item['cat'] == 'cmc':
         cat_sets[key] = set(df[df['cmc'] == item['value']]['name'])
 
 n = len(opt)
-matrix = np.zeros((n, n), dtype=bool)
+matrix = np.zeros((n, n), dtype=int)
 for i in range(n):
     for j in range(i, n):
         k1, k2 = f"{opt[i]['cat']}_{opt[i]['value']}", f"{opt[j]['cat']}_{opt[j]['value']}"
-        if len(cat_sets[k1] & cat_sets[k2]) >= MIN_CARDS_PER_CELL:
-            matrix[i, j] = matrix[j, i] = True
+        count = len(cat_sets[k1] & cat_sets[k2])
+        matrix[i, j] = matrix[j, i] = count
 
 def is_axis_valid(group_indices):
     cats = [opt[i]['cat'] for i in group_indices]
@@ -86,10 +100,9 @@ def is_axis_valid(group_indices):
         if cats.count(c) > 1 and c in ['cmc']: return False
     return True
 
-# --- 2. DATABASE INITIALIZATION ---
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
-cursor.execute("PRAGMA synchronous = OFF") # Speed boost for massive inserts
+cursor.execute("PRAGMA synchronous = OFF")
 cursor.execute("PRAGMA journal_mode = MEMORY")
 
 cursor.executescript("""
@@ -102,18 +115,15 @@ cursor.executescript("""
     CREATE TABLE compatible_pairs (row_trio_id INT, col_trio_id INT);
 """)
 
-# Store Categories
 cursor.executemany("INSERT INTO categories VALUES (?, ?, ?)", 
                    [(i, x['cat'], str(x['value'])) for i, x in enumerate(opt)])
 
-# Store Valid Trios
 raw_trios = list(combinations(range(len(opt)), 3))
 valid_trios = [t for t in raw_trios if is_axis_valid(t)]
 cursor.executemany("INSERT INTO trios (id, c1_idx, c2_idx, c3_idx) VALUES (?, ?, ?, ?)", 
                    [(i, t[0], t[1], t[2]) for i, t in enumerate(valid_trios)])
 conn.commit()
 
-# --- 3. EFFICIENT GRID SOLVER ---
 def find_and_store_pairs():
     batch = []
     total_saved = 0
@@ -121,10 +131,8 @@ def find_and_store_pairs():
     print(f"Finding compatible pairs among {len(valid_trios):,} trios...")
     for r_id, r_trio in enumerate(tqdm(valid_trios)):
         for c_id, c_trio in enumerate(valid_trios):
-            # 1. Axis Overlap Check
             if set(r_trio) & set(c_trio): continue
             
-            # 2. Mutually Exclusive Categories (CMC vs CMC)
             conflict = False
             for ri in r_trio:
                 for ci in c_trio:
@@ -133,10 +141,15 @@ def find_and_store_pairs():
                 if conflict: break
             if conflict: continue
 
-            # 3. Fast Matrix Check (All 9 cells must be True)
-            if (matrix[r_trio[0], c_trio[0]] and matrix[r_trio[0], c_trio[1]] and matrix[r_trio[0], c_trio[2]] and
-                matrix[r_trio[1], c_trio[0]] and matrix[r_trio[1], c_trio[1]] and matrix[r_trio[1], c_trio[2]] and
-                matrix[r_trio[2], c_trio[0]] and matrix[r_trio[2], c_trio[1]] and matrix[r_trio[2], c_trio[2]]):
+            if (matrix[r_trio[0], c_trio[0]] >= MIN_CARDS_PER_CELL and 
+                matrix[r_trio[0], c_trio[1]] >= MIN_CARDS_PER_CELL and 
+                matrix[r_trio[0], c_trio[2]] >= MIN_CARDS_PER_CELL and
+                matrix[r_trio[1], c_trio[0]] >= MIN_CARDS_PER_CELL and 
+                matrix[r_trio[1], c_trio[1]] >= MIN_CARDS_PER_CELL and 
+                matrix[r_trio[1], c_trio[2]] >= MIN_CARDS_PER_CELL and
+                matrix[r_trio[2], c_trio[0]] >= MIN_CARDS_PER_CELL and 
+                matrix[r_trio[2], c_trio[1]] >= MIN_CARDS_PER_CELL and 
+                matrix[r_trio[2], c_trio[2]] >= MIN_CARDS_PER_CELL):
                 
                 batch.append((r_id, c_id))
 
@@ -151,7 +164,6 @@ def find_and_store_pairs():
         conn.commit()
         total_saved += len(batch)
     
-    # Create an index for lightning fast random queries
     print("Creating index...")
     cursor.execute("CREATE INDEX idx_pairs ON compatible_pairs(row_trio_id, col_trio_id)")
     conn.close()
